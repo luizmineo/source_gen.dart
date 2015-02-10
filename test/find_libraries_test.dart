@@ -37,8 +37,9 @@ void main() {
   });
 }
 
+@deprecated
 Future<AnalysisContext> _getContext() async {
-  var context = getAnalysisContextForProjectPath(getPackagePath());
+  var context = await getAnalysisContextForProjectPath(getPackagePath());
 
   var testFilesPath = p.join(getPackagePath(), 'test', 'test_files');
 
