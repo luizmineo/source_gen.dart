@@ -3,11 +3,14 @@ library source_gen.json_serial.generator;
 import 'dart:async';
 import 'package:analyzer/src/generated/element.dart';
 import 'package:analyzer/src/generated/utilities_dart.dart';
+import 'package:mustache4dart/mustache4dart.dart';
 
 import 'package:source_gen/source_gen.dart';
 import 'package:source_gen/src/utils.dart';
 
 import 'json_serializable.dart';
+
+part 'json_serializable_template.dart';
 
 // TODO: toJson option to omit null/empty values
 class JsonSerializableGenerator
@@ -17,137 +20,116 @@ class JsonSerializableGenerator
   @override
   Future<String> generateForAnnotatedElement(
       Element element, JsonSerializable annotation) async {
+    
     if (element is! ClassElement) {
       var friendlyName = frieldlyNameForElement(element);
       throw new InvalidGenerationSourceError(
           'Generator cannot target `$friendlyName`.',
           todo: 'Remove the JsonSerializable annotation from `$friendlyName`.');
     }
+    
+    var context = <String, dynamic>{};
 
     var classElement = element as ClassElement;
     var className = classElement.name;
-
-    // Get all of the fields that need to be assigned
-    // TODO: support overriding the field set with an annotation option
-    var fields = classElement.fields.fold(<String, FieldElement>{},
+    
+    context['className'] = className;
+    
+    var fieldTypes = classElement.fields.fold(<String, FieldElement>{},
         (map, field) {
       map[field.name] = field;
       return map;
     }) as Map<String, FieldElement>;
-
-    // Get the constructor to use for the factory
-
-    var prefix = '_\$${className}';
-
-    var buffer = new StringBuffer();
-
-    if (annotation.createFactory) {
-      _writeFactory(buffer, classElement, fields, prefix);
-    }
-
+    
+    //Build mixin class
     if (annotation.createToJson) {
-      //
-      // Generate the mixin class
-      //
-      buffer.writeln('abstract class ${prefix}SerializerMixin {');
 
-      // write fields
-      fields.forEach((name, field) {
-        buffer.writeln('  ${field.type.name} get $name;');
+      // Get all of the fields that need to be assigned
+      // TODO: support overriding the field set with an annotation option
+      var fields = classElement.fields.fold(<Map<String, dynamic>>[],
+          (list, field) {
+        list.add({
+          "name": field.name,
+          "type": field.type.name,
+          "value": _fieldToJsonMapValue(field.name, field),
+          "printComma": true
+        });
+        return list;
+        
+      }) as List<Map<String, dynamic>>;
+      
+      if (!fields.isEmpty) fields.last['printComma'] = false;
+      
+      context['fields'] = fields;
+      context['createToJson'] = true;
+    
+    }
+    
+    //Build factory
+    if (annotation.createFactory) {
+    
+      // Get the default constructor
+      // TODO: allow overriding the ctor used for the factory
+      var ctor = classElement.constructors.singleWhere((ce) => ce.name == '');
+      
+      // creating a copy so it can be mutated
+      var fieldsToSet = new Map<String, FieldElement>.from(fieldTypes);
+      
+      var ctorArgs = <Map<String, dynamic>>[];
+      
+      for (var arg in ctor.parameters) {
+        var field = fieldTypes[arg.name];
+  
+        if (field == null) {
+          if (arg.parameterKind == ParameterKind.REQUIRED) {
+            throw 'Cannot populate the required constructor argument: ${arg.displayName}.';
+          }
+          continue;
+        }
+        
+        ctorArgs.add({
+          "named": arg.parameterKind == ParameterKind.NAMED,
+          "name": arg.name,
+          "value": _jsonMapAccessToField(arg.name, fieldTypes[arg.name]),
+          "printComma": true
+        });
+        fieldsToSet.remove(arg.name);
+        
+      }
+      
+      if (!ctorArgs.isEmpty) ctorArgs.last["printComma"] = false;
+      
+      var finalFields = fieldsToSet.values.where((field) => field.isFinal).toSet();
+  
+      if (finalFields.isNotEmpty) {
+        throw new InvalidGenerationSourceError(
+            'Generator cannot target `$className`.',
+            todo: 'Make the following fields writable or add them to the '
+            'constructor with matching names: '
+            '${finalFields.map((field) => field.name).join(', ')}.');
+      }
+      
+      var ctorFieldsToSet = <Map<String, dynamic>>[];
+      fieldsToSet.forEach((name, field) {
+        ctorFieldsToSet.add({
+          "name": name,
+          "value": _jsonMapAccessToField(name, fieldTypes[name]),
+        });
       });
-
-      // write toJson method
-      buffer.writeln('  Map<String, dynamic> toJson() => <String, dynamic>{');
-
-      var pairs = <String>[];
-      fields.forEach((name, field) {
-        pairs.add("'$name': ${_fieldToJsonMapValue(name, field)}");
-      });
-      buffer.writeln(pairs.join(','));
-
-      buffer.writeln('  };');
-
-      buffer.write('}');
+      
+      if (!ctorFieldsToSet.isEmpty) ctorFieldsToSet.last['printSemicolon'] = true;
+    
+      context['ctorArgs'] = ctorArgs;
+      context['ctorFieldsToSet'] = ctorFieldsToSet;
+      context['createFactory'] = true;
+      
     }
 
-    return buffer.toString();
+    return render(template, context);
   }
 
   @override
   String toString() => 'JsonGenerator';
-}
-
-void _writeFactory(StringBuffer buffer, ClassElement classElement,
-    Map<String, FieldElement> fields, String prefix) {
-  // creating a copy so it can be mutated
-  var fieldsToSet = new Map<String, FieldElement>.from(fields);
-  var className = classElement.displayName;
-  // Create the factory method
-
-  // Get the default constructor
-  // TODO: allow overriding the ctor used for the factory
-  var ctor = classElement.constructors.singleWhere((ce) => ce.name == '');
-
-  var ctorArguments = <String>[];
-  var ctorNamedArguments = <String>[];
-
-  for (var arg in ctor.parameters) {
-    var field = fields[arg.name];
-
-    if (field == null) {
-      if (arg.parameterKind == ParameterKind.REQUIRED) {
-        throw 'Cannot populate the required constructor argument: ${arg.displayName}.';
-      }
-      continue;
-    }
-
-    // TODO: validate that the types match!
-    if (arg.parameterKind == ParameterKind.NAMED) {
-      ctorNamedArguments.add(arg.name);
-    } else {
-      ctorArguments.add(arg.name);
-    }
-    fieldsToSet.remove(arg.name);
-  }
-
-  var finalFields = fieldsToSet.values.where((field) => field.isFinal).toSet();
-
-  if (finalFields.isNotEmpty) {
-    throw new InvalidGenerationSourceError(
-        'Generator cannot target `$className`.',
-        todo: 'Make the following fields writable or add them to the '
-        'constructor with matching names: '
-        '${finalFields.map((field) => field.name).join(', ')}.');
-  }
-
-  //
-  // Generate the static factory method
-  //
-  buffer.writeln();
-  buffer.writeln('$className ${prefix}FromJson(Map json) =>');
-  buffer.write('    new $className(');
-  buffer.writeAll(
-      ctorArguments.map((name) => _jsonMapAccessToField(name, fields[name])),
-      ', ');
-  if (ctorArguments.isNotEmpty && ctorNamedArguments.isNotEmpty) {
-    buffer.write(', ');
-  }
-  buffer.writeAll(ctorNamedArguments
-          .map((name) => '$name: ' + _jsonMapAccessToField(name, fields[name])),
-      ', ');
-
-  buffer.write(')');
-  if (fieldsToSet.isEmpty) {
-    buffer.writeln(';');
-  } else {
-    fieldsToSet.forEach((name, field) {
-      buffer.writeln();
-      buffer.write("      ..${name} = ");
-      buffer.write(_jsonMapAccessToField(name, field));
-    });
-    buffer.writeln(';');
-  }
-  buffer.writeln();
 }
 
 String _fieldToJsonMapValue(String name, FieldElement field) {
